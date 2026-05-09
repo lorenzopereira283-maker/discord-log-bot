@@ -1,280 +1,363 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 import os
 from dotenv import load_dotenv
 from datetime import datetime
 
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-
-# Canais separados para cada tipo de log
-JOIN_CHANNEL_ID  = int(os.getenv("JOIN_CHANNEL_ID"))   # canal: #entradas
-LEAVE_CHANNEL_ID = int(os.getenv("LEAVE_CHANNEL_ID"))  # canal: #saídas
-LOG_CHANNEL_ID   = int(os.getenv("LOG_CHANNEL_ID"))    # canal: #logs-gerais
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+JOIN_CHANNEL_ID = int(os.getenv('JOIN_CHANNEL_ID'))
+LEAVE_CHANNEL_ID = int(os.getenv('LEAVE_CHANNEL_ID'))
+LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID'))
+LIBERAR_CHANNEL_ID = int(os.getenv('LIBERAR_CHANNEL_ID'))
 
 intents = discord.Intents.all()
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix='!', intents=intents)
 
-
-# ──────────────────────────────────────────────
-#  FUNÇÕES AUXILIARES
-# ──────────────────────────────────────────────
-def embed_log(title, description, color, author=None):
-    embed = discord.Embed(
-        title=title,
-        description=description,
-        color=color,
-        timestamp=datetime.utcnow()
-    )
-    if author:
-        embed.set_author(name=str(author), icon_url=author.display_avatar.url)
-    embed.set_footer(text="LogBot")
-    return embed
-
-
+# ───────────────────────────────────────────────
+# HELPER: send embed to channel
+# ───────────────────────────────────────────────
 async def send_to(guild, channel_id, embed):
     channel = guild.get_channel(channel_id)
     if channel:
         await channel.send(embed=embed)
 
+# ───────────────────────────────────────────────
+# MODAL: Formulário de Liberação
+# ───────────────────────────────────────────────
+class LiberacaoModal(discord.ui.Modal, title='Sistema de Liberação'):
+    identificador = discord.ui.TextInput(
+        label='Identificador',
+        placeholder='Ex: 12345',
+        required=True,
+        max_length=20
+    )
+    nome = discord.ui.TextInput(
+        label='Nome e Sobrenome',
+        placeholder='Ex: João Silva',
+        required=True,
+        max_length=50
+    )
+    cargo = discord.ui.TextInput(
+        label='Cargo pretendido',
+        placeholder='Suporte / Moderador / Admin / Diretor',
+        required=True,
+        max_length=20
+    )
 
-# ──────────────────────────────────────────────
-#  BOT READY
-# ──────────────────────────────────────────────
+    async def on_submit(self, interaction: discord.Interaction):
+        cargos_validos = ['suporte', 'moderador', 'admin', 'diretor']
+        cargo_input = self.cargo.value.strip().lower()
+
+        if cargo_input not in cargos_validos:
+            await interaction.response.send_message(
+                '❌ Cargo inválido! Escolhe entre: Suporte, Moderador, Admin ou Diretor.',
+                ephemeral=True
+            )
+            return
+
+        guild = interaction.guild
+
+        # Encontrar cargos Diretor e Admin para permissões do ticket
+        cargo_diretor = discord.utils.get(guild.roles, name='Diretor')
+        cargo_admin = discord.utils.get(guild.roles, name='¦ Admin')
+
+        # Encontrar ou criar categoria Tickets
+        categoria = discord.utils.get(guild.categories, name='Tickets')
+        if not categoria:
+            categoria = await guild.create_category('Tickets')
+
+        # Permissões do canal ticket
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        }
+        if cargo_diretor:
+            overwrites[cargo_diretor] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+        if cargo_admin:
+            overwrites[cargo_admin] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+
+        # Criar canal do ticket
+        nome_canal = f'lib-{interaction.user.name}'.lower().replace(' ', '-')[:30]
+        ticket_channel = await categoria.create_text_channel(nome_canal, overwrites=overwrites)
+
+        # Embed do ticket
+        embed = discord.Embed(
+            title='📋 Pedido de Liberação',
+            color=0x2ecc71,
+            timestamp=datetime.utcnow()
+        )
+        embed.add_field(name='👤 Utilizador', value=interaction.user.mention, inline=True)
+        embed.add_field(name='🆔 Identificador', value=self.identificador.value, inline=True)
+        embed.add_field(name='📛 Nome', value=self.nome.value, inline=True)
+        embed.add_field(name='🎖️ Cargo Pretendido', value=self.cargo.value.capitalize(), inline=True)
+        embed.set_footer(text=f'ID: {interaction.user.id}')
+
+        mencoes = ''
+        if cargo_diretor:
+            mencoes += cargo_diretor.mention + ' '
+        if cargo_admin:
+            mencoes += cargo_admin.mention
+
+        view = TicketView(
+            requerente=interaction.user,
+            nome_personagem=self.nome.value,
+            cargo_pretendido=self.cargo.value.capitalize()
+        )
+
+        await ticket_channel.send(content=mencoes, embed=embed, view=view)
+
+        await interaction.response.send_message(
+            f'✅ O teu pedido foi enviado! Aguarda resposta em {ticket_channel.mention}',
+            ephemeral=True
+        )
+
+
+# ───────────────────────────────────────────────
+# VIEW: Botões Aceitar / Recusar no ticket
+# ───────────────────────────────────────────────
+class TicketView(discord.ui.View):
+    def __init__(self, requerente: discord.Member, nome_personagem: str, cargo_pretendido: str):
+        super().__init__(timeout=None)
+        self.requerente = requerente
+        self.nome_personagem = nome_personagem
+        self.cargo_pretendido = cargo_pretendido
+
+    @discord.ui.button(label='✅ Aceitar', style=discord.ButtonStyle.success)
+    async def aceitar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        membro = guild.get_member(self.requerente.id)
+
+        if not membro:
+            await interaction.response.send_message('❌ Utilizador não encontrado no servidor.', ephemeral=True)
+            return
+
+        # Mudar apelido para Ac | Nome
+        try:
+            await membro.edit(nick=f'Ac | {self.nome_personagem}')
+        except discord.Forbidden:
+            pass
+
+        # Dar cargo
+        cargo_obj = discord.utils.find(
+            lambda r: r.name.lower().strip('¦ ').strip() == self.cargo_pretendido.lower(),
+            guild.roles
+        )
+        if cargo_obj:
+            try:
+                await membro.add_roles(cargo_obj)
+            except discord.Forbidden:
+                pass
+
+        # Mensagem privada ao utilizador
+        try:
+            await membro.send(
+                f'✅ O teu pedido de liberação foi **aceite**!\n'
+                f'O teu apelido foi alterado para **Ac | {self.nome_personagem}** e recebeste o cargo **{self.cargo_pretendido}**.'
+            )
+        except discord.Forbidden:
+            pass
+
+        await interaction.response.send_message(f'✅ Pedido aceite por {interaction.user.mention}!')
+        await interaction.channel.delete()
+
+    @discord.ui.button(label='❌ Recusar', style=discord.ButtonStyle.danger)
+    async def recusar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        membro = guild.get_member(self.requerente.id)
+
+        # Mensagem privada ao utilizador
+        if membro:
+            try:
+                await membro.send(
+                    f'❌ O teu pedido de liberação foi **recusado**.\n'
+                    f'Podes tentar novamente mais tarde.'
+                )
+            except discord.Forbidden:
+                pass
+
+        await interaction.response.send_message(f'❌ Pedido recusado por {interaction.user.mention}.')
+        await interaction.channel.delete()
+
+
+# ───────────────────────────────────────────────
+# VIEW: Botão principal "Realizar Liberação"
+# ───────────────────────────────────────────────
+class LiberacaoView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label='✅ Realizar Liberação', style=discord.ButtonStyle.success, custom_id='liberacao_btn')
+    async def liberacao(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LiberacaoModal())
+
+
+# ───────────────────────────────────────────────
+# COMANDO: !liberar — envia a mensagem de liberação
+# ───────────────────────────────────────────────
+@bot.command(name='liberar')
+@commands.has_permissions(administrator=True)
+async def liberar(ctx):
+    embed = discord.Embed(
+        title='🔓 Sistema de Liberação do Servidor',
+        description=(
+            '**Bem-vindo ao sistema de liberação!**\n\n'
+            '• Conecta-te ao servidor primeiro e tem a tua identificação em mãos.\n'
+            '• Clica no botão abaixo para preencheres o formulário.\n'
+            '• Após o envio, um superior irá aceitar ou recusar o teu pedido.'
+        ),
+        color=0x2ecc71
+    )
+    embed.set_footer(text=ctx.guild.name)
+    await ctx.send(embed=embed, view=LiberacaoView())
+    await ctx.message.delete()
+
+
+# ───────────────────────────────────────────────
+# EVENTOS DE LOG
+# ───────────────────────────────────────────────
+
 @bot.event
 async def on_ready():
-    print(f"✅ Bot online como {bot.user}")
-    print(f"   📥 Canal de entradas : {JOIN_CHANNEL_ID}")
-    print(f"   📤 Canal de saídas   : {LEAVE_CHANNEL_ID}")
-    print(f"   📋 Canal de logs     : {LOG_CHANNEL_ID}")
+    print(f'✅ Bot online como {bot.user}')
+    channel_join = bot.get_channel(JOIN_CHANNEL_ID)
+    channel_leave = bot.get_channel(LEAVE_CHANNEL_ID)
+    channel_log = bot.get_channel(LOG_CHANNEL_ID)
+    if channel_join:
+        print(f'📥 Canal de entradas : {channel_join.name}')
+    if channel_leave:
+        print(f'📤 Canal de saídas   : {channel_leave.name}')
+    if channel_log:
+        print(f'📋 Canal de logs     : {channel_log.name}')
+    # Registar view persistente
+    bot.add_view(LiberacaoView())
 
-
-# ──────────────────────────────────────────────
-#  MEMBRO ENTROU  →  canal #entradas
-# ──────────────────────────────────────────────
+# Membro entrou
 @bot.event
 async def on_member_join(member):
-    embed = embed_log(
-        "📥 Bem-vindo ao servidor!",
-        f"👤 {member.mention} entrou no servidor.\n"
-        f"🆔 **ID:** `{member.id}`\n"
-        f"📅 **Conta criada:** {discord.utils.format_dt(member.created_at, 'R')}\n"
-        f"👥 **Total de membros:** {member.guild.member_count}",
-        discord.Color.green(),
-        member
+    embed = discord.Embed(
+        title='📥 Membro Entrou',
+        color=0x2ecc71,
+        timestamp=datetime.utcnow()
     )
     embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name='Utilizador', value=f'{member.mention} ({member})', inline=False)
+    embed.add_field(name='ID', value=member.id, inline=True)
+    embed.add_field(name='Conta criada', value=f'há {(datetime.utcnow() - member.created_at.replace(tzinfo=None)).days} dias', inline=True)
+    embed.add_field(name='Total de membros', value=member.guild.member_count, inline=True)
     await send_to(member.guild, JOIN_CHANNEL_ID, embed)
 
-
-# ──────────────────────────────────────────────
-#  MEMBRO SAIU  →  canal #saídas
-# ──────────────────────────────────────────────
+# Membro saiu
 @bot.event
 async def on_member_remove(member):
-    roles = [r.mention for r in member.roles if r.name != "@everyone"]
-    roles_text = ", ".join(roles) if roles else "Nenhum"
-
-    embed = embed_log(
-        "📤 Membro Saiu",
-        f"👤 **{member}** saiu do servidor.\n"
-        f"🆔 **ID:** `{member.id}`\n"
-        f"📅 **Entrou em:** {discord.utils.format_dt(member.joined_at, 'R') if member.joined_at else 'Desconhecido'}\n"
-        f"🏷️ **Cargos que tinha:** {roles_text}\n"
-        f"👥 **Total de membros:** {member.guild.member_count}",
-        discord.Color.red(),
-        member
+    embed = discord.Embed(
+        title='📤 Membro Saiu',
+        color=0xe74c3c,
+        timestamp=datetime.utcnow()
     )
     embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name='Utilizador', value=f'{member} ({member.id})', inline=False)
+    cargos = [r.mention for r in member.roles if r.name != '@everyone']
+    embed.add_field(name='Cargos', value=' '.join(cargos) if cargos else 'Nenhum', inline=False)
     await send_to(member.guild, LEAVE_CHANNEL_ID, embed)
 
-
-# ──────────────────────────────────────────────
-#  BANIMENTO  →  logs gerais
-# ──────────────────────────────────────────────
-@bot.event
-async def on_member_ban(guild, user):
-    embed = embed_log(
-        "🔨 Membro Banido",
-        f"**{user}** (`{user.id}`) foi banido do servidor.",
-        discord.Color.dark_red(),
-        user
-    )
-    await send_to(guild, LOG_CHANNEL_ID, embed)
-
-
-@bot.event
-async def on_member_unban(guild, user):
-    embed = embed_log(
-        "✅ Ban Removido",
-        f"**{user}** (`{user.id}`) foi desbanido do servidor.",
-        discord.Color.teal(),
-        user
-    )
-    await send_to(guild, LOG_CHANNEL_ID, embed)
-
-
-# ──────────────────────────────────────────────
-#  ATUALIZAÇÃO DE MEMBRO  →  logs gerais
-# ──────────────────────────────────────────────
-@bot.event
-async def on_member_update(before, after):
-    changes = []
-
-    if before.nick != after.nick:
-        changes.append(f"**Nickname:** `{before.nick or 'Nenhum'}` → `{after.nick or 'Nenhum'}`")
-
-    if before.roles != after.roles:
-        added   = [r.mention for r in after.roles  if r not in before.roles]
-        removed = [r.mention for r in before.roles if r not in after.roles]
-        if added:   changes.append(f"**Cargos adicionados:** {', '.join(added)}")
-        if removed: changes.append(f"**Cargos removidos:** {', '.join(removed)}")
-
-    if changes:
-        embed = embed_log("✏️ Membro Atualizado", "\n".join(changes), discord.Color.blue(), after)
-        await send_to(after.guild, LOG_CHANNEL_ID, embed)
-
-
-# ──────────────────────────────────────────────
-#  MENSAGENS  →  logs gerais
-# ──────────────────────────────────────────────
+# Mensagem apagada
 @bot.event
 async def on_message_delete(message):
-    if message.author.bot or not message.guild:
+    if message.author.bot:
         return
-    content = message.content or "*[sem conteúdo de texto]*"
-    embed = embed_log(
-        "🗑️ Mensagem Apagada",
-        f"**Autor:** {message.author.mention}\n"
-        f"**Canal:** {message.channel.mention}\n"
-        f"**Conteúdo:** {content[:1024]}",
-        discord.Color.red(),
-        message.author
-    )
+    embed = discord.Embed(title='🗑️ Mensagem Apagada', color=0xe74c3c, timestamp=datetime.utcnow())
+    embed.add_field(name='Autor', value=f'{message.author.mention} ({message.author})', inline=False)
+    embed.add_field(name='Canal', value=message.channel.mention, inline=True)
+    embed.add_field(name='Conteúdo', value=message.content[:1000] if message.content else '*sem texto*', inline=False)
     await send_to(message.guild, LOG_CHANNEL_ID, embed)
 
-
+# Mensagem editada
 @bot.event
 async def on_message_edit(before, after):
-    if before.author.bot or not before.guild:
+    if before.author.bot or before.content == after.content:
         return
-    if before.content == after.content:
-        return
-    embed = embed_log(
-        "✏️ Mensagem Editada",
-        f"**Autor:** {before.author.mention}\n"
-        f"**Canal:** {before.channel.mention}\n"
-        f"**Antes:** {before.content[:512]}\n"
-        f"**Depois:** {after.content[:512]}\n"
-        f"[Ver mensagem]({after.jump_url})",
-        discord.Color.gold(),
-        before.author
-    )
+    embed = discord.Embed(title='✏️ Mensagem Editada', color=0xf39c12, timestamp=datetime.utcnow())
+    embed.add_field(name='Autor', value=f'{before.author.mention} ({before.author})', inline=False)
+    embed.add_field(name='Canal', value=before.channel.mention, inline=True)
+    embed.add_field(name='Antes', value=before.content[:500] if before.content else '*vazio*', inline=False)
+    embed.add_field(name='Depois', value=after.content[:500] if after.content else '*vazio*', inline=False)
     await send_to(before.guild, LOG_CHANNEL_ID, embed)
 
+# Canal criado
+@bot.event
+async def on_guild_channel_create(channel):
+    embed = discord.Embed(title='📢 Canal Criado', color=0x2ecc71, timestamp=datetime.utcnow())
+    embed.add_field(name='Nome', value=channel.name, inline=True)
+    embed.add_field(name='Tipo', value=str(channel.type), inline=True)
+    await send_to(channel.guild, LOG_CHANNEL_ID, embed)
 
-# ──────────────────────────────────────────────
-#  VOZ  →  logs gerais
-# ──────────────────────────────────────────────
+# Canal apagado
+@bot.event
+async def on_guild_channel_delete(channel):
+    embed = discord.Embed(title='🗑️ Canal Apagado', color=0xe74c3c, timestamp=datetime.utcnow())
+    embed.add_field(name='Nome', value=channel.name, inline=True)
+    await send_to(channel.guild, LOG_CHANNEL_ID, embed)
+
+# Cargo criado
+@bot.event
+async def on_guild_role_create(role):
+    embed = discord.Embed(title='🏷️ Cargo Criado', color=role.color, timestamp=datetime.utcnow())
+    embed.add_field(name='Nome', value=role.name, inline=True)
+    await send_to(role.guild, LOG_CHANNEL_ID, embed)
+
+# Cargo apagado
+@bot.event
+async def on_guild_role_delete(role):
+    embed = discord.Embed(title='🗑️ Cargo Apagado', color=0xe74c3c, timestamp=datetime.utcnow())
+    embed.add_field(name='Nome', value=role.name, inline=True)
+    await send_to(role.guild, LOG_CHANNEL_ID, embed)
+
+# Membro atualizado (nickname/cargos)
+@bot.event
+async def on_member_update(before, after):
+    if before.nick != after.nick:
+        embed = discord.Embed(title='📝 Nickname Alterado', color=0x3498db, timestamp=datetime.utcnow())
+        embed.add_field(name='Utilizador', value=after.mention, inline=False)
+        embed.add_field(name='Antes', value=before.nick or before.name, inline=True)
+        embed.add_field(name='Depois', value=after.nick or after.name, inline=True)
+        await send_to(after.guild, LOG_CHANNEL_ID, embed)
+
+    if before.roles != after.roles:
+        added = [r.mention for r in after.roles if r not in before.roles]
+        removed = [r.mention for r in before.roles if r not in after.roles]
+        if added or removed:
+            embed = discord.Embed(title='🔄 Cargos Atualizados', color=0x9b59b6, timestamp=datetime.utcnow())
+            embed.add_field(name='Utilizador', value=after.mention, inline=False)
+            if added:
+                embed.add_field(name='Adicionados', value=' '.join(added), inline=True)
+            if removed:
+                embed.add_field(name='Removidos', value=' '.join(removed), inline=True)
+            await send_to(after.guild, LOG_CHANNEL_ID, embed)
+
+# Voz
 @bot.event
 async def on_voice_state_update(member, before, after):
     if before.channel == after.channel:
         return
-    if before.channel is None:
-        title, desc, color = "🎙️ Entrou em Voz", f"{member.mention} entrou em **{after.channel.name}**", discord.Color.green()
-    elif after.channel is None:
-        title, desc, color = "🔇 Saiu de Voz", f"{member.mention} saiu de **{before.channel.name}**", discord.Color.red()
-    else:
-        title, desc, color = "🔀 Mudou de Canal de Voz", f"{member.mention} moveu-se de **{before.channel.name}** → **{after.channel.name}**", discord.Color.blue()
-    embed = embed_log(title, desc, color, member)
-    await send_to(member.guild, LOG_CHANNEL_ID, embed)
+    if after.channel and not before.channel:
+        embed = discord.Embed(title='🎙️ Entrou no Canal de Voz', color=0x2ecc71, timestamp=datetime.utcnow())
+        embed.add_field(name='Utilizador', value=member.mention, inline=True)
+        embed.add_field(name='Canal', value=after.channel.name, inline=True)
+        await send_to(member.guild, LOG_CHANNEL_ID, embed)
+    elif before.channel and not after.channel:
+        embed = discord.Embed(title='🔇 Saiu do Canal de Voz', color=0xe74c3c, timestamp=datetime.utcnow())
+        embed.add_field(name='Utilizador', value=member.mention, inline=True)
+        embed.add_field(name='Canal', value=before.channel.name, inline=True)
+        await send_to(member.guild, LOG_CHANNEL_ID, embed)
+    elif before.channel and after.channel:
+        embed = discord.Embed(title='🔀 Mudou de Canal de Voz', color=0xf39c12, timestamp=datetime.utcnow())
+        embed.add_field(name='Utilizador', value=member.mention, inline=True)
+        embed.add_field(name='Antes', value=before.channel.name, inline=True)
+        embed.add_field(name='Depois', value=after.channel.name, inline=True)
+        await send_to(member.guild, LOG_CHANNEL_ID, embed)
 
-
-# ──────────────────────────────────────────────
-#  CANAIS  →  logs gerais
-# ──────────────────────────────────────────────
-@bot.event
-async def on_guild_channel_create(channel):
-    embed = embed_log("📢 Canal Criado", f"**Nome:** {channel.mention}\n**Tipo:** {str(channel.type).capitalize()}", discord.Color.green())
-    await send_to(channel.guild, LOG_CHANNEL_ID, embed)
-
-
-@bot.event
-async def on_guild_channel_delete(channel):
-    embed = embed_log("🗑️ Canal Apagado", f"**Nome:** #{channel.name}\n**Tipo:** {str(channel.type).capitalize()}", discord.Color.red())
-    await send_to(channel.guild, LOG_CHANNEL_ID, embed)
-
-
-@bot.event
-async def on_guild_channel_update(before, after):
-    changes = []
-    if before.name != after.name:
-        changes.append(f"**Nome:** `{before.name}` → `{after.name}`")
-    if hasattr(before, "topic") and before.topic != after.topic:
-        changes.append(f"**Tópico:** `{before.topic}` → `{after.topic}`")
-    if changes:
-        embed = embed_log("🔧 Canal Atualizado", "\n".join(changes), discord.Color.blue())
-        await send_to(after.guild, LOG_CHANNEL_ID, embed)
-
-
-# ──────────────────────────────────────────────
-#  CARGOS  →  logs gerais
-# ──────────────────────────────────────────────
-@bot.event
-async def on_guild_role_create(role):
-    embed = embed_log("🏷️ Cargo Criado", f"**Nome:** {role.mention}\n**Cor:** `{role.color}`", discord.Color.green())
-    await send_to(role.guild, LOG_CHANNEL_ID, embed)
-
-
-@bot.event
-async def on_guild_role_delete(role):
-    embed = embed_log("🗑️ Cargo Apagado", f"**Nome:** `{role.name}`", discord.Color.red())
-    await send_to(role.guild, LOG_CHANNEL_ID, embed)
-
-
-@bot.event
-async def on_guild_role_update(before, after):
-    changes = []
-    if before.name != after.name:
-        changes.append(f"**Nome:** `{before.name}` → `{after.name}`")
-    if before.color != after.color:
-        changes.append(f"**Cor:** `{before.color}` → `{after.color}`")
-    if before.permissions != after.permissions:
-        changes.append("**Permissões foram alteradas**")
-    if changes:
-        embed = embed_log("🔧 Cargo Atualizado", "\n".join(changes), discord.Color.blue())
-        await send_to(after.guild, LOG_CHANNEL_ID, embed)
-
-
-# ──────────────────────────────────────────────
-#  SERVIDOR  →  logs gerais
-# ──────────────────────────────────────────────
-@bot.event
-async def on_guild_update(before, after):
-    changes = []
-    if before.name != after.name:
-        changes.append(f"**Nome:** `{before.name}` → `{after.name}`")
-    if before.icon != after.icon:
-        changes.append("**Ícone do servidor foi alterado**")
-    if changes:
-        embed = embed_log("🏠 Servidor Atualizado", "\n".join(changes), discord.Color.blue())
-        await send_to(after, LOG_CHANNEL_ID, embed)
-
-
-# ──────────────────────────────────────────────
-#  EMOJIS  →  logs gerais
-# ──────────────────────────────────────────────
-@bot.event
-async def on_guild_emojis_update(guild, before, after):
-    added   = [e for e in after  if e not in before]
-    removed = [e for e in before if e not in after]
-    if added:
-        embed = embed_log("😀 Emoji Adicionado", " ".join(str(e) for e in added), discord.Color.green())
-        await send_to(guild, LOG_CHANNEL_ID, embed)
-    if removed:
-        embed = embed_log("😶 Emoji Removido", ", ".join(f"`:{e.name}:`" for e in removed), discord.Color.red())
-        await send_to(guild, LOG_CHANNEL_ID, embed)
-
-
-bot.run(TOKEN)
+bot.run(DISCORD_TOKEN)
