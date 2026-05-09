@@ -213,7 +213,10 @@ async def liberar(ctx):
     )
     embed.set_footer(text=ctx.guild.name)
     await ctx.send(embed=embed, view=LiberacaoView())
-    await ctx.message.delete()
+    try:
+        await ctx.message.delete()
+    except:
+        pass
 
 
 # ───────────────────────────────────────────────
