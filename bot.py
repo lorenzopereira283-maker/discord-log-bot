@@ -17,6 +17,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 # Mapeamento cargo -> prefixo do apelido e nome do cargo no servidor
 CARGOS_MAP = {
+    'membro-t': {'prefixo': 'Ac-t | \U0001f410', 'cargo_nome': '\u00a6 Junior'},
     'membro':   {'prefixo': 'Ac | \U0001f410', 'cargo_nome': '\u00a6 Membro'},
     'sub':      {'prefixo': 'Sub | \U0001f410', 'cargo_nome': '\u00a6 Sub'},
     'lider':    {'prefixo': 'Lid | \U0001f410', 'cargo_nome': '\u00a6 Lider'},
@@ -45,7 +46,7 @@ class LiberacaoModal(discord.ui.Modal, title='Sistema de Liberacao'):
     )
     cargo = discord.ui.TextInput(
         label='Cargo pretendido',
-        placeholder='Membro / Sub / Lider / Auxiliar / Resp / ADM',
+        placeholder='Membro-T / Membro / Sub / Lider / Auxiliar / Resp / ADM',
         required=True,
         max_length=20
     )
@@ -55,7 +56,7 @@ class LiberacaoModal(discord.ui.Modal, title='Sistema de Liberacao'):
 
         if cargo_input not in CARGOS_MAP:
             await interaction.response.send_message(
-                'Cargo invalido! Escolhe entre: Membro, Sub, Lider, Auxiliar, Resp ou ADM.',
+                'Cargo invalido! Escolhe entre: Membro-T, Membro, Sub, Lider, Auxiliar, Resp ou ADM.',
                 ephemeral=True
             )
             return
